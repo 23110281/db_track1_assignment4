@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+    expose:
+      - "3306"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: app/backend/Dockerfile
+    restart: always
+    environment:
+      MYSQL_HOST: db
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_EMAIL: dummy@dummy.com
+      SMTP_PASSWORD: dummy
+    ports:
+      - "5001:5001"
+    depends_on:
+      db:
+        condition: service_healthy

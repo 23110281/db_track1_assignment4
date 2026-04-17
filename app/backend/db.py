@@ -1,6 +1,6 @@
 import mysql.connector
 import config
-from shard_db import NUM_SHARDS, query_shard, query_all_shards, execute_shard, execute_all_shards, get_shard_for_member
+from shard_db import NUM_SHARDS, query_shard, query_all_shards, execute_shard, execute_all_shards, get_shard_for_member, insert_replicated_row
 from shard_config import SHARD_KEY_MAP, REPLICATED_TABLES
 import re
 
@@ -102,6 +102,10 @@ def execute_db(sql, args=None):
             except: pass
 
     is_insert = "INSERT" in sql.upper()
+
+    if is_insert and table in REPLICATED_TABLES:
+        return insert_replicated_row(sql, args)
+
     if is_insert and table in SHARD_KEY_MAP:
         shard_col = SHARD_KEY_MAP[table]
         # Parse standard INSERT INTO Table (Col1, Col2) VALUES (%s, %s)
@@ -117,16 +121,14 @@ def execute_db(sql, args=None):
                 # Fallback to broadcasting
                 pass
     
-    # Default for Replicated tables, non-INSERTs, or fallback
-    try:
-        # Since we use audit triggers, we theoretically should pass User variables.
-        # But we don't have AuditLog tables on remote shards anyway, so triggers won't fire/fail gracefully
-        for shard_id in range(NUM_SHARDS):
-            execute_shard(shard_id, sql, args)
-    except Exception as e:
-        print(f"Execute fan-out failed: {e}")
-        
-    return 0
+    if table in REPLICATED_TABLES:
+        execute_all_shards(sql, args)
+        return 0
+
+    raise RuntimeError(
+        f"execute_db refused write on sharded table '{table}'. "
+        "Use explicit route-level shard routing with execute_shard/execute_all_shards."
+    )
 
 def execute_transaction(statements):
     """Execute multiple SQL statements sequentially across all shards."""

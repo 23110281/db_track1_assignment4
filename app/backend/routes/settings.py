@@ -1,8 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.security import check_password_hash, generate_password_hash
-from db import query_db, execute_db
-from shard_db import query_shard, execute_shard, get_shard_for_member
+from shard_db import query_shard, query_all_shards, execute_shard, get_shard_for_member
 from audit import log_action, get_current_username
 
 settings_bp = Blueprint('settings', __name__)
@@ -102,7 +101,11 @@ def change_username():
         return jsonify(error=message), 400
 
     # Check if username is taken (cross-shard query necessary as username is not shard key)
-    existing = query_db("SELECT MemberID FROM Member WHERE Username = %s AND MemberID != %s", (new_username, user_id), one=True)
+    existing_rows = query_all_shards(
+        "SELECT MemberID FROM Member WHERE Username = %s AND MemberID != %s",
+        (new_username, user_id),
+    )
+    existing = existing_rows[0] if existing_rows else None
     if existing:
         return jsonify(error='Username is already taken'), 409
 

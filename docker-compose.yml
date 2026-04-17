@@ -1,7 +1,9 @@
 version: '3.8'
 
 services:
-  db:
+  # Local control-plane MySQL used for non-sharded tables (AuditLog, OTPVerification).
+  # Assignment shard tables are hosted on 3307/3308/3309 and routed via shard_config.py.
+  control_db:
     image: mysql:8.0
     restart: always
     environment:
@@ -24,7 +26,7 @@ services:
       dockerfile: app/backend/Dockerfile
     restart: always
     environment:
-      MYSQL_HOST: db
+      MYSQL_HOST: control_db
       MYSQL_USER: root
       MYSQL_PASSWORD: root
       SMTP_HOST: smtp.gmail.com
@@ -34,5 +36,5 @@ services:
     ports:
       - "5001:5001"
     depends_on:
-      db:
+      control_db:
         condition: service_healthy

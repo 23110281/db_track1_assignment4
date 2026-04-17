@@ -1,6 +1,13 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from db import query_db, execute_db
+from shard_db import (
+    query_shard,
+    query_all_shards,
+    execute_shard,
+    execute_all_shards,
+    get_shard_for_member,
+    insert_replicated_row,
+)
 from audit import log_action, get_current_username
 
 jobs_bp = Blueprint('jobs', __name__)
@@ -9,7 +16,7 @@ jobs_bp = Blueprint('jobs', __name__)
 @jobs_bp.route('/jobs', methods=['GET'])
 @jwt_required()
 def get_jobs():
-    rows = query_db("""
+    rows = query_all_shards("""
         SELECT j.*, m.Name AS AlumniName, m.AvatarColor,
                a.CurrentOrganization
         FROM JobPost j
@@ -37,7 +44,8 @@ def get_jobs():
 @jwt_required()
 def create_job():
     user_id = int(get_jwt_identity())
-    member = query_db("SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    user_shard = get_shard_for_member(user_id)
+    member = query_shard(user_shard, "SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
     if not member or member['MemberType'] != 'Alumni':
         return jsonify(error='Only alumni can post jobs'), 403
 
@@ -50,7 +58,7 @@ def create_job():
     if not all([title, company, description]):
         return jsonify(error='Title, company, and description are required'), 400
 
-    job_id = execute_db(
+    job_id = insert_replicated_row(
         "INSERT INTO JobPost (AlumniID, Title, Company, Description, ApplicationLink, PostedAt) VALUES (%s,%s,%s,%s,%s, NOW())",
         (user_id, title, company, description, link or None),
     )
@@ -62,14 +70,15 @@ def create_job():
 @jwt_required()
 def update_job(job_id):
     user_id = int(get_jwt_identity())
-    job = query_db("SELECT * FROM JobPost WHERE JobID = %s", (job_id,), one=True)
+    job_rows = query_all_shards("SELECT * FROM JobPost WHERE JobID = %s", (job_id,))
+    job = job_rows[0] if job_rows else None
     if not job:
         return jsonify(error='Job not found'), 404
     if job['AlumniID'] != user_id:
         return jsonify(error='Unauthorized'), 403
 
     data = request.get_json()
-    execute_db("""
+    execute_all_shards("""
         UPDATE JobPost SET Title=%s, Company=%s, Description=%s, ApplicationLink=%s
         WHERE JobID = %s
     """, (
@@ -87,15 +96,17 @@ def update_job(job_id):
 @jwt_required()
 def delete_job(job_id):
     user_id = int(get_jwt_identity())
-    job = query_db("SELECT * FROM JobPost WHERE JobID = %s", (job_id,), one=True)
+    job_rows = query_all_shards("SELECT * FROM JobPost WHERE JobID = %s", (job_id,))
+    job = job_rows[0] if job_rows else None
     if not job:
         return jsonify(error='Job not found'), 404
-    member = query_db("SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    user_shard = get_shard_for_member(user_id)
+    member = query_shard(user_shard, "SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
     is_admin = member and member['IsAdmin']
     if job['AlumniID'] != user_id and not is_admin:
         return jsonify(error='Unauthorized'), 403
 
-    execute_db("DELETE FROM JobPost WHERE JobID = %s", (job_id,))
+    execute_all_shards("DELETE FROM JobPost WHERE JobID = %s", (job_id,))
     log_action('DELETE_JOB', f"Deleted job posting {job_id}", user=get_current_username())
     return jsonify(message='Job deleted')
 
@@ -104,10 +115,11 @@ def delete_job(job_id):
 @jwt_required()
 def get_referrals():
     user_id = int(get_jwt_identity())
-    member = query_db("SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    user_shard = get_shard_for_member(user_id)
+    member = query_shard(user_shard, "SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
 
     if member and member['MemberType'] == 'Alumni':
-        rows = query_db("""
+        rows = query_all_shards("""
             SELECT r.*, m.Name AS StudentName
             FROM ReferralRequest r
             JOIN Member m ON r.StudentID = m.MemberID
@@ -115,7 +127,7 @@ def get_referrals():
             ORDER BY r.RequestedAt DESC
         """, (user_id,))
     else:
-        rows = query_db("""
+        rows = query_all_shards("""
             SELECT r.*, m.Name AS AlumniName
             FROM ReferralRequest r
             JOIN Member m ON r.TargetAlumniID = m.MemberID
@@ -148,8 +160,9 @@ def get_referrals():
 def create_referral():
     user_id = int(get_jwt_identity())
     data = request.get_json()
+    user_shard = get_shard_for_member(user_id)
 
-    referral_id = execute_db("""
+    referral_id = execute_shard(user_shard, """
         INSERT INTO ReferralRequest (StudentID, TargetAlumniID, TargetCompany, TargetRole, JobPostingURL, Status, RequestedAt)
         VALUES (%s,%s,%s,%s,%s,'Pending', NOW())
     """, (
@@ -167,7 +180,8 @@ def create_referral():
 @jwt_required()
 def update_referral(request_id):
     user_id = int(get_jwt_identity())
-    ref = query_db("SELECT * FROM ReferralRequest WHERE RequestID = %s", (request_id,), one=True)
+    ref_rows = query_all_shards("SELECT * FROM ReferralRequest WHERE RequestID = %s", (request_id,))
+    ref = ref_rows[0] if ref_rows else None
     if not ref:
         return jsonify(error='Referral not found'), 404
     if ref['TargetAlumniID'] != user_id:
@@ -178,6 +192,7 @@ def update_referral(request_id):
     if status not in ('Approved', 'Rejected'):
         return jsonify(error='Invalid status'), 400
 
-    execute_db("UPDATE ReferralRequest SET Status = %s WHERE RequestID = %s", (status, request_id))
+    ref_shard = get_shard_for_member(ref['StudentID'])
+    execute_shard(ref_shard, "UPDATE ReferralRequest SET Status = %s WHERE RequestID = %s", (status, request_id))
     log_action('UPDATE_REFERRAL', f"Updated referral {request_id} status to {status}", user=get_current_username())
     return jsonify(message='Referral updated')

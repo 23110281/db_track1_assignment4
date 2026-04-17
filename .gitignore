@@ -5,3 +5,14 @@ __pycache__/
 app/backend/__pycache__/shard_db.cpython-314.pyc
 venv/
 .env
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.bbl
+*.blg
+*.synctex.gz
+*.fls
+*.fdb_latexmk

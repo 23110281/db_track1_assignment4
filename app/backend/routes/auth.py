@@ -2,10 +2,8 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity, get_jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
-from db import query_db, execute_db
 from shard_db import query_all_shards, execute_shard, get_shard_for_member
 from audit import log_action
-import random
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -97,7 +95,9 @@ def register():
         return jsonify(error='Username or email already exists'), 409
 
     pw_hash = generate_password_hash(password)
-    member_id = random.randint(100000, 9999999) # Generate unique shard key
+    # Allocate a deterministic global MemberID to keep IDs sequential across shards.
+    max_rows = query_all_shards("SELECT COALESCE(MAX(MemberID), 0) AS max_id FROM Member")
+    member_id = (max(r['max_id'] for r in max_rows) if max_rows else 0) + 1
     shard_id = get_shard_for_member(member_id)
 
     execute_shard(shard_id,

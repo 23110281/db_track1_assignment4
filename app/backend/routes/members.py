@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required
-from db import query_db
+from shard_db import query_all_shards
 
 members_bp = Blueprint('members', __name__)
 
@@ -23,7 +23,7 @@ def get_members():
         args.append(member_type)
 
     sql += " ORDER BY Name"
-    rows = query_db(sql, tuple(args))
+    rows = query_all_shards(sql, tuple(args))
 
     result = []
     for r in rows:

@@ -1,6 +1,5 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from db import query_db, execute_db
 from shard_db import query_all_shards, execute_shard, execute_all_shards, get_shard_for_member
 from audit import log_action, get_current_username
 

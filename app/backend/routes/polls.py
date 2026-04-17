@@ -1,7 +1,14 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from datetime import datetime
-from db import query_db, execute_db, execute_transaction
+from shard_db import (
+    query_shard,
+    query_all_shards,
+    execute_shard,
+    execute_all_shards,
+    get_shard_for_member,
+    insert_replicated_row,
+)
 from audit import log_action, get_current_username
 
 polls_bp = Blueprint('polls', __name__)
@@ -11,16 +18,21 @@ polls_bp = Blueprint('polls', __name__)
 @jwt_required()
 def get_polls():
     user_id = int(get_jwt_identity())
-    polls = query_db("""
+    polls = query_all_shards("""
         SELECT p.*, m.Name AS CreatorName, m.AvatarColor
         FROM Poll p
         JOIN Member m ON p.CreatorID = m.MemberID
         ORDER BY p.CreatedAt DESC
     """)
 
-    result = []
+    # Poll table is replicated, so dedupe by PollID after fan-out.
+    unique_polls = {}
     for poll in polls:
-        options = query_db("""
+        unique_polls[poll['PollID']] = poll
+
+    result = []
+    for poll in sorted(unique_polls.values(), key=lambda p: str(p['CreatedAt']), reverse=True):
+        options_rows = query_all_shards("""
             SELECT po.OptionID, po.OptionText,
                    (SELECT COUNT(*) FROM PollVote WHERE OptionID = po.OptionID) AS votes
             FROM PollOption po
@@ -28,8 +40,20 @@ def get_polls():
             ORDER BY po.OptionID
         """, (poll['PollID'],))
 
+        options_agg = {}
+        for opt in options_rows:
+            if opt['OptionID'] not in options_agg:
+                options_agg[opt['OptionID']] = {
+                    'OptionID': opt['OptionID'],
+                    'OptionText': opt['OptionText'],
+                    'votes': 0,
+                }
+            options_agg[opt['OptionID']]['votes'] += opt['votes']
+        options = sorted(options_agg.values(), key=lambda x: x['OptionID'])
+
         # Check if user already voted on this poll
-        user_vote = query_db("""
+        user_shard = get_shard_for_member(user_id)
+        user_vote = query_shard(user_shard, """
             SELECT pv.OptionID FROM PollVote pv
             JOIN PollOption po ON pv.OptionID = po.OptionID
             WHERE po.PollID = %s AND pv.MemberID = %s
@@ -72,12 +96,12 @@ def create_poll():
     except (ValueError, AttributeError):
         expires_str = expires_at  # fallback
 
-    poll_id = execute_db(
+    poll_id = insert_replicated_row(
         "INSERT INTO Poll (CreatorID, Question, CreatedAt, ExpiresAt) VALUES (%s,%s, NOW(),%s)",
         (user_id, question, expires_str),
     )
     for opt in options:
-        execute_db(
+        insert_replicated_row(
             "INSERT INTO PollOption (PollID, OptionText) VALUES (%s,%s)",
             (poll_id, opt),
         )
@@ -89,10 +113,12 @@ def create_poll():
 @jwt_required()
 def update_poll(poll_id):
     user_id = int(get_jwt_identity())
-    poll = query_db("SELECT * FROM Poll WHERE PollID = %s", (poll_id,), one=True)
+    poll_rows = query_all_shards("SELECT * FROM Poll WHERE PollID = %s", (poll_id,))
+    poll = poll_rows[0] if poll_rows else None
     if not poll:
         return jsonify(error='Poll not found'), 404
-    member = query_db("SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    user_shard = get_shard_for_member(user_id)
+    member = query_shard(user_shard, "SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
     is_admin = member and member['IsAdmin']
     if poll['CreatorID'] != user_id and not is_admin:
         return jsonify(error='Unauthorized'), 403
@@ -103,18 +129,18 @@ def update_poll(poll_id):
     if not question:
         return jsonify(error='Question is required'), 400
 
-    # Build all statements for a single transaction
-    stmts = [("UPDATE Poll SET Question = %s WHERE PollID = %s", (question, poll_id))]
+    execute_all_shards("UPDATE Poll SET Question = %s WHERE PollID = %s", (question, poll_id))
 
     # If options are provided, replace them (delete votes + old options, insert new)
     if options is not None and len(options) >= 2:
-        stmts.append(("DELETE FROM PollVote WHERE OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)", (poll_id,)))
-        stmts.append(("DELETE FROM PollOption WHERE PollID = %s", (poll_id,)))
+        execute_all_shards(
+            "DELETE FROM PollVote WHERE OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)",
+            (poll_id,),
+        )
+        execute_all_shards("DELETE FROM PollOption WHERE PollID = %s", (poll_id,))
         for opt in options:
             if opt.strip():
-                stmts.append(("INSERT INTO PollOption (PollID, OptionText) VALUES (%s,%s)", (poll_id, opt.strip())))
-
-    execute_transaction(stmts)
+                insert_replicated_row("INSERT INTO PollOption (PollID, OptionText) VALUES (%s,%s)", (poll_id, opt.strip()))
 
     log_action('UPDATE_POLL', f"Updated poll {poll_id}: '{question}'", user=get_current_username())
     return jsonify(message='Poll updated')
@@ -124,20 +150,22 @@ def update_poll(poll_id):
 @jwt_required()
 def delete_poll(poll_id):
     user_id = int(get_jwt_identity())
-    poll = query_db("SELECT * FROM Poll WHERE PollID = %s", (poll_id,), one=True)
+    poll_rows = query_all_shards("SELECT * FROM Poll WHERE PollID = %s", (poll_id,))
+    poll = poll_rows[0] if poll_rows else None
     if not poll:
         return jsonify(error='Poll not found'), 404
-    member = query_db("SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    user_shard = get_shard_for_member(user_id)
+    member = query_shard(user_shard, "SELECT IsAdmin FROM Member WHERE MemberID = %s", (user_id,), one=True)
     is_admin = member and member['IsAdmin']
     if poll['CreatorID'] != user_id and not is_admin:
         return jsonify(error='Unauthorized'), 403
 
-    # Delete votes, options, then poll in single transaction
-    execute_transaction([
-        ("DELETE FROM PollVote WHERE OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)", (poll_id,)),
-        ("DELETE FROM PollOption WHERE PollID = %s", (poll_id,)),
-        ("DELETE FROM Poll WHERE PollID = %s", (poll_id,)),
-    ])
+    execute_all_shards(
+        "DELETE FROM PollVote WHERE OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)",
+        (poll_id,),
+    )
+    execute_all_shards("DELETE FROM PollOption WHERE PollID = %s", (poll_id,))
+    execute_all_shards("DELETE FROM Poll WHERE PollID = %s", (poll_id,))
     log_action('DELETE_POLL', f"Deleted poll {poll_id}", user=get_current_username())
     return jsonify(message='Poll deleted')
 
@@ -153,18 +181,21 @@ def vote_poll(poll_id):
         return jsonify(error='optionId required'), 400
 
     # Check option belongs to this poll
-    opt = query_db(
+    opt_rows = query_all_shards(
         "SELECT * FROM PollOption WHERE OptionID = %s AND PollID = %s",
-        (option_id, poll_id), one=True,
+        (option_id, poll_id),
     )
+    opt = opt_rows[0] if opt_rows else None
     if not opt:
         return jsonify(error='Invalid option'), 400
 
-    # Remove any existing vote and insert new one in a single transaction
-    execute_transaction([
-        ("DELETE FROM PollVote WHERE MemberID = %s AND OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)", (user_id, poll_id)),
-        ("INSERT INTO PollVote (OptionID, MemberID) VALUES (%s,%s)", (option_id, user_id)),
-    ])
+    user_shard = get_shard_for_member(user_id)
+    execute_shard(
+        user_shard,
+        "DELETE FROM PollVote WHERE MemberID = %s AND OptionID IN (SELECT OptionID FROM PollOption WHERE PollID = %s)",
+        (user_id, poll_id),
+    )
+    execute_shard(user_shard, "INSERT INTO PollVote (OptionID, MemberID) VALUES (%s,%s)", (option_id, user_id))
     log_action('VOTE_POLL', f"Voted on poll {poll_id}, option {option_id}", user=get_current_username())
     return jsonify(message='Vote recorded')
 
@@ -173,7 +204,8 @@ def vote_poll(poll_id):
 @jwt_required()
 def unvote_poll(poll_id):
     user_id = int(get_jwt_identity())
-    execute_db("""
+    user_shard = get_shard_for_member(user_id)
+    execute_shard(user_shard, """
         DELETE FROM PollVote WHERE MemberID = %s AND OptionID IN
         (SELECT OptionID FROM PollOption WHERE PollID = %s)
     """, (user_id, poll_id))

@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from db import query_db
+from shard_db import query_shard, query_all_shards, get_shard_for_member
 
 attendance_bp = Blueprint('attendance', __name__)
 
@@ -9,10 +9,12 @@ attendance_bp = Blueprint('attendance', __name__)
 @jwt_required()
 def get_class_attendance():
     student_id = request.args.get('studentId', int(get_jwt_identity()))
+    student_id = int(student_id)
     month = request.args.get('month', '03')
     year = request.args.get('year', '2026')
+    shard_id = get_shard_for_member(student_id)
 
-    records = query_db("""
+    records = query_shard(shard_id, """
         SELECT ca.AttendanceID, ca.CourseID, ca.RecordDate, ca.Status,
                c.CourseCode, c.CourseName
         FROM ClassAttendance ca
@@ -51,10 +53,12 @@ def get_class_attendance():
 @jwt_required()
 def get_mess_attendance():
     student_id = request.args.get('studentId', int(get_jwt_identity()))
+    student_id = int(student_id)
     month = request.args.get('month', '03')
     year = request.args.get('year', '2026')
+    shard_id = get_shard_for_member(student_id)
 
-    records = query_db("""
+    records = query_shard(shard_id, """
         SELECT * FROM MessAttendance
         WHERE StudentID = %s
           AND MONTH(RecordDate) = %s
@@ -86,9 +90,11 @@ def get_mess_attendance():
 @jwt_required()
 def get_streaks():
     student_id = request.args.get('studentId', int(get_jwt_identity()))
+    student_id = int(student_id)
+    shard_id = get_shard_for_member(student_id)
 
     # Class streak
-    class_records = query_db("""
+    class_records = query_shard(shard_id, """
         SELECT RecordDate, Status FROM ClassAttendance
         WHERE StudentID = %s ORDER BY RecordDate DESC
     """, (student_id,))
@@ -100,7 +106,7 @@ def get_streaks():
             break
 
     # Mess streak
-    mess_records = query_db("""
+    mess_records = query_shard(shard_id, """
         SELECT RecordDate, Status FROM MessAttendance
         WHERE StudentID = %s ORDER BY RecordDate DESC, FIELD(MealType, 'Dinner', 'Lunch', 'Breakfast')
     """, (student_id,))
@@ -120,14 +126,18 @@ def get_streaks():
 @attendance_bp.route('/leaderboard', methods=['GET'])
 @jwt_required()
 def get_leaderboard():
-    students = query_db("SELECT s.MemberID FROM Student s JOIN Member m ON s.MemberID = m.MemberID WHERE m.IsAdmin = FALSE")
+    students = query_all_shards(
+        "SELECT s.MemberID FROM Student s JOIN Member m ON s.MemberID = m.MemberID WHERE m.IsAdmin = FALSE"
+    )
 
     leaderboard = []
     for s in students:
         sid = s['MemberID']
-        member = query_db("SELECT Name, AvatarColor FROM Member WHERE MemberID = %s", (sid,), one=True)
+        sid_shard = get_shard_for_member(sid)
+        member = query_shard(sid_shard, "SELECT Name, AvatarColor FROM Member WHERE MemberID = %s", (sid,), one=True)
 
-        class_records = query_db(
+        class_records = query_shard(
+            sid_shard,
             "SELECT Status FROM ClassAttendance WHERE StudentID = %s ORDER BY RecordDate DESC", (sid,)
         )
         class_streak = 0
@@ -137,7 +147,8 @@ def get_leaderboard():
             else:
                 break
 
-        mess_records = query_db(
+        mess_records = query_shard(
+            sid_shard,
             "SELECT Status FROM MessAttendance WHERE StudentID = %s ORDER BY RecordDate DESC, FIELD(MealType, 'Dinner', 'Lunch', 'Breakfast')",
             (sid,),
         )

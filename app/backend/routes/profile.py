@@ -1,7 +1,6 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from db import query_db, execute_db
-from shard_db import query_shard, execute_shard, get_shard_for_member
+from shard_db import query_shard, query_all_shards, execute_shard, get_shard_for_member
 from audit import log_action, get_current_username
 
 profile_bp = Blueprint('profile', __name__)
@@ -121,7 +120,9 @@ def get_claims(member_id):
 
     result = []
     for c in claims:
-        user_vote = query_db(
+        user_shard = get_shard_for_member(user_id)
+        user_vote = query_shard(
+            user_shard,
             "SELECT IsAgree FROM ProfileClaimVote WHERE ClaimID = %s AND VoterID = %s",
             (c['ClaimID'], user_id), one=True,
         )
@@ -164,7 +165,8 @@ def create_claim(member_id):
 @jwt_required()
 def update_claim(claim_id):
     user_id = int(get_jwt_identity())
-    claim = query_db("SELECT * FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,), one=True)
+    claim_rows = query_all_shards("SELECT * FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,))
+    claim = claim_rows[0] if claim_rows else None
     if not claim:
         return jsonify(error='Claim not found'), 404
     if claim['MemberID'] != user_id:
@@ -184,7 +186,8 @@ def update_claim(claim_id):
 @jwt_required()
 def delete_claim(claim_id):
     user_id = int(get_jwt_identity())
-    claim = query_db("SELECT * FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,), one=True)
+    claim_rows = query_all_shards("SELECT * FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,))
+    claim = claim_rows[0] if claim_rows else None
     if not claim:
         return jsonify(error='Claim not found'), 404
     if claim['MemberID'] != user_id:

@@ -28,19 +28,30 @@ IITGN Connect is a full-stack college social media platform built with **React**
 ### Prerequisites
 
 - **Python 3.10+**
-- **Docker & Docker Compose** (For spawning the 3 sharded MySQL nodes)
+- **Docker & Docker Compose** (for local control-plane DB: `AuditLog` and `OTPVerification`)
 - **Node.js 18+** and **npm**
 
 ### Quick Start
 
-**1. Start the Remote Shard Docker Containers**
+**1. Ensure Assignment Shards Are Reachable**
 
-Ensure the remote shard databases are running on your server infrastructure mapping correctly:
+Assignment 4 data tables are deployed to three shard instances (remote infra used in our setup):
+
 - Shard 0: Port `3307`
 - Shard 1: Port `3308`
 - Shard 2: Port `3309`
 
-**2. Backend Setup**
+The shard connection targets are configured in `app/backend/shard_config.py`.
+
+**2. Start Local Control-Plane Services (Docker Compose)**
+
+This project keeps `AuditLog` and `OTPVerification` on a local MySQL instance used by the API.
+
+```bash
+docker compose up -d
+```
+
+**3. Backend Setup**
 
 ```bash
 cd app/backend
@@ -49,19 +60,36 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**3. Configure Environment**
+**4. Configure Environment**
 
-Edit `app/backend/.env`. Ensure you map the MySQL variables exactly to the remote Docker host defined in `shard_config.py` (e.g. `10.0.116.184`):
+Edit `app/backend/.env`.
+
+Important separation:
+
+- `MYSQL_*` values are for the local control-plane database only.
+- Shard host/port/user/password are taken from `app/backend/shard_config.py`.
+
+Example for local run (without compose):
 
 ```env
-MYSQL_HOST=10.0.116.184
-MYSQL_USER=Chernaugh
-MYSQL_PASSWORD=password@123
+MYSQL_HOST=localhost
+MYSQL_USER=root
+MYSQL_PASSWORD=root
+MYSQL_DB=iitgn_connect
 SMTP_HOST=smtp.gmail.com
 # ... other standard SMTP mappings
 ```
 
-**4. Deploy Sharded Schemas & Seed Data**
+Example when API runs via compose service network:
+
+```env
+MYSQL_HOST=control_db
+MYSQL_USER=root
+MYSQL_PASSWORD=root
+MYSQL_DB=iitgn_connect
+```
+
+**5. Deploy Sharded Schemas & Seed Data**
 
 Assignment 4 relies strictly on explicitly routed environments. Execute the native Python schema generation framework to inject prefixed namespaces (`shard_0_Member`, `shard_1_Member`, etc) and subsequently scatter the seed data computationally over the hashes:
 
@@ -69,9 +97,10 @@ Assignment 4 relies strictly on explicitly routed environments. Execute the nati
 python setup_shards.py
 python seed_shards.py
 ```
-> *(The verification constraints strictly monitor terminal feedback ensuring zero overlap existed organically across these deployments).*
 
-**5. Start the Backend**
+> _(The verification constraints strictly monitor terminal feedback ensuring zero overlap existed organically across these deployments)._
+
+**6. Start the Backend**
 
 ```bash
 cd app/backend
@@ -79,7 +108,7 @@ python app.py
 # API server securely proxies across all 3 databases parallel at http://localhost:5001
 ```
 
-**6. Start the Frontend** (new terminal)
+**7. Start the Frontend** (new terminal)
 
 ```bash
 cd app/iitgn-connect
@@ -98,13 +127,13 @@ Our implementation fundamentally shifted the project from a Vertically Scaled Mo
 2. **Hash-Based Distribution**: Application logic enforces `MemberID % 3`, cleanly and automatically translating generic Python API calls into rigidly allocated explicit node routes (Ports 3307, 3308, or 3309).
 3. **Scatter-Gather Assembly**: When parsing operations lacking context vectors (like a global chronological `Post` Timeline), our API dynamically multi-threads scatter scans across all active partitions natively, caching partial subsets in memory, sorting matrices locally on the Flask server, and effectively masking the partitioning complexity away from the front-end user's timeline.
 
-*View `assignment4_report.md` for our raw Empirical Validation tests executing explicit Point mapping guarantees and trade-off architectures.*
+_View `assignment4_report.md` for our raw Empirical Validation tests executing explicit Point mapping guarantees and trade-off architectures._
 
 ---
 
 ## 2. Database Schema, API & Session Management
 
-*(From core Assignment 1 and 2 directives)*
+_(From core Assignment 1 and 2 directives)_
 
 The backend exposes **40+ RESTful API endpoints**. Following our Assignment 4 sharding refactoring, API endpoints internally use `execute_shard(shard_id)` instead of the legacy `execute_db()` broadcast mechanism.
 
@@ -122,7 +151,7 @@ The backend exposes **40+ RESTful API endpoints**. Following our Assignment 4 sh
 
 ## 4. Indexing & Query Optimization
 
-*(Retained extensively from existing deployments)*
+_(Retained extensively from existing deployments)_
 
 Our **26 custom indexes** remain highly active on the local target tables (`idx_post_createdat` naturally filters row evaluations even on distributed isolated fetches). Benchmarking EXPLAIN output confirms `+99% speedup` reductions by collapsing full table scans universally even while nested in single partitions.
 
@@ -131,6 +160,7 @@ Our **26 custom indexes** remain highly active on the local target tables (`idx_
 ## Team
 
 **Team Chernaugh**
+
 - Parthiv Patel
 - Shriniket Behera
 - Ridham Patel

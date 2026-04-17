@@ -1,6 +1,13 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from db import query_db, execute_db
+from shard_db import (
+    query_shard,
+    query_all_shards,
+    execute_shard,
+    execute_all_shards,
+    get_shard_for_member,
+    insert_replicated_row,
+)
 from audit import log_action, get_current_username
 
 groups_bp = Blueprint('groups', __name__)
@@ -10,10 +17,11 @@ groups_bp = Blueprint('groups', __name__)
 @jwt_required()
 def get_groups():
     user_id = int(get_jwt_identity())
+    user_shard = get_shard_for_member(user_id)
     search = request.args.get('search', '').strip()
 
     if search:
-        rows = query_db("""
+        rows = query_all_shards("""
             SELECT g.*,
                    (SELECT COUNT(*) FROM GroupMembership WHERE GroupID = g.GroupID AND Status = 'approved') AS memberCount,
                    m.Name AS AdminName
@@ -23,7 +31,7 @@ def get_groups():
             ORDER BY g.GroupID
         """, (f'%{search}%', f'%{search}%'))
     else:
-        rows = query_db("""
+        rows = query_all_shards("""
             SELECT g.*,
                    (SELECT COUNT(*) FROM GroupMembership WHERE GroupID = g.GroupID AND Status = 'approved') AS memberCount,
                    m.Name AS AdminName
@@ -34,13 +42,25 @@ def get_groups():
 
     # Get membership status for current user
     my_memberships = {}
-    for r in query_db(
+    for r in query_shard(
+        user_shard,
         "SELECT GroupID, Status FROM GroupMembership WHERE MemberID = %s", (user_id,)
     ):
         my_memberships[r['GroupID']] = r['Status']
 
-    result = []
+    unique_groups = {}
     for r in rows:
+        gid = r['GroupID']
+        if gid not in unique_groups:
+            unique_groups[gid] = dict(r)
+            unique_groups[gid]['memberCount'] = r.get('memberCount', 0)
+        else:
+            unique_groups[gid]['memberCount'] += r.get('memberCount', 0)
+            if not unique_groups[gid].get('AdminName') and r.get('AdminName'):
+                unique_groups[gid]['AdminName'] = r.get('AdminName')
+
+    result = []
+    for r in sorted(unique_groups.values(), key=lambda x: x['GroupID']):
         membership_status = my_memberships.get(r['GroupID'])
         result.append({
             'GroupID': r['GroupID'],
@@ -69,13 +89,15 @@ def create_group():
     if not name:
         return jsonify(error='Group name is required'), 400
 
-    group_id = execute_db(
+    group_id = insert_replicated_row(
         "INSERT INTO CampusGroup (Name, Description, AdminID, IsRestricted, CreatedAt) VALUES (%s,%s,%s,%s, CURDATE())",
         (name, description, user_id, is_restricted),
     )
 
     # Add creator as Admin member
-    execute_db(
+    user_shard = get_shard_for_member(user_id)
+    execute_shard(
+        user_shard,
         "INSERT INTO GroupMembership (GroupID, MemberID, Role, Status, JoinedAt) VALUES (%s,%s,'Admin','approved', CURDATE())",
         (group_id, user_id),
     )
@@ -87,16 +109,17 @@ def create_group():
 @groups_bp.route('/<int:group_id>', methods=['GET'])
 @jwt_required()
 def get_group(group_id):
-    group = query_db("""
+    group_rows = query_all_shards("""
         SELECT g.*, m.Name AS AdminName
         FROM CampusGroup g
         LEFT JOIN Member m ON g.AdminID = m.MemberID
         WHERE g.GroupID = %s
-    """, (group_id,), one=True)
+    """, (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
 
-    members = query_db("""
+    members = query_all_shards("""
         SELECT gm.Role, gm.JoinedAt, m.MemberID, m.Username, m.Name, m.MemberType, m.AvatarColor
         FROM GroupMembership gm
         JOIN Member m ON gm.MemberID = m.MemberID
@@ -105,7 +128,9 @@ def get_group(group_id):
     """, (group_id,))
 
     user_id = int(get_jwt_identity())
-    my_membership = query_db(
+    user_shard = get_shard_for_member(user_id)
+    my_membership = query_shard(
+        user_shard,
         "SELECT Status FROM GroupMembership WHERE GroupID = %s AND MemberID = %s",
         (group_id, user_id), one=True,
     )
@@ -113,11 +138,11 @@ def get_group(group_id):
     # Count pending requests (for admin)
     pending_count = 0
     if group['AdminID'] == user_id:
-        row = query_db(
+        rows = query_all_shards(
             "SELECT COUNT(*) AS cnt FROM GroupMembership WHERE GroupID = %s AND Status = 'pending'",
-            (group_id,), one=True,
+            (group_id,),
         )
-        pending_count = row['cnt'] if row else 0
+        pending_count = sum(r['cnt'] for r in rows)
 
     return jsonify({
         'GroupID': group['GroupID'],
@@ -146,7 +171,9 @@ def get_group(group_id):
 @jwt_required()
 def join_group(group_id):
     user_id = int(get_jwt_identity())
-    existing = query_db(
+    user_shard = get_shard_for_member(user_id)
+    existing = query_shard(
+        user_shard,
         "SELECT * FROM GroupMembership WHERE GroupID = %s AND MemberID = %s",
         (group_id, user_id), one=True,
     )
@@ -156,7 +183,8 @@ def join_group(group_id):
         if existing['Status'] == 'pending':
             return jsonify(error='Request already pending'), 409
         # If rejected, allow re-request
-        execute_db(
+        execute_shard(
+            user_shard,
             "UPDATE GroupMembership SET Status = 'pending', JoinedAt = CURDATE() WHERE GroupID = %s AND MemberID = %s",
             (group_id, user_id),
         )
@@ -164,19 +192,22 @@ def join_group(group_id):
         return jsonify(message='Join request sent', pending=True)
 
     # Check if group is restricted
-    group = query_db("SELECT IsRestricted FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT IsRestricted FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
 
     if group['IsRestricted']:
-        execute_db(
+        execute_shard(
+            user_shard,
             "INSERT INTO GroupMembership (GroupID, MemberID, Role, Status, JoinedAt) VALUES (%s,%s,'Member','pending', CURDATE())",
             (group_id, user_id),
         )
         log_action('JOIN_REQUEST', f"Requested to join restricted group {group_id}", user=get_current_username())
         return jsonify(message='Join request sent', pending=True)
     else:
-        execute_db(
+        execute_shard(
+            user_shard,
             "INSERT INTO GroupMembership (GroupID, MemberID, Role, Status, JoinedAt) VALUES (%s,%s,'Member','approved', CURDATE())",
             (group_id, user_id),
         )
@@ -188,7 +219,9 @@ def join_group(group_id):
 @jwt_required()
 def leave_group(group_id):
     user_id = int(get_jwt_identity())
-    execute_db(
+    user_shard = get_shard_for_member(user_id)
+    execute_shard(
+        user_shard,
         "DELETE FROM GroupMembership WHERE GroupID = %s AND MemberID = %s",
         (group_id, user_id),
     )
@@ -200,13 +233,14 @@ def leave_group(group_id):
 @jwt_required()
 def get_pending_requests(group_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
         return jsonify(error='Only admin can view pending requests'), 403
 
-    rows = query_db("""
+    rows = query_all_shards("""
         SELECT gm.JoinedAt, m.MemberID, m.Username, m.Name, m.MemberType, m.AvatarColor
         FROM GroupMembership gm
         JOIN Member m ON gm.MemberID = m.MemberID
@@ -228,13 +262,16 @@ def get_pending_requests(group_id):
 @jwt_required()
 def approve_request(group_id, member_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
         return jsonify(error='Only admin can approve requests'), 403
 
-    execute_db(
+    target_shard = get_shard_for_member(member_id)
+    execute_shard(
+        target_shard,
         "UPDATE GroupMembership SET Status = 'approved', JoinedAt = CURDATE() WHERE GroupID = %s AND MemberID = %s AND Status = 'pending'",
         (group_id, member_id),
     )
@@ -246,13 +283,16 @@ def approve_request(group_id, member_id):
 @jwt_required()
 def reject_request(group_id, member_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
         return jsonify(error='Only admin can reject requests'), 403
 
-    execute_db(
+    target_shard = get_shard_for_member(member_id)
+    execute_shard(
+        target_shard,
         "DELETE FROM GroupMembership WHERE GroupID = %s AND MemberID = %s AND Status = 'pending'",
         (group_id, member_id),
     )
@@ -264,7 +304,8 @@ def reject_request(group_id, member_id):
 @jwt_required()
 def update_group(group_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
@@ -278,7 +319,7 @@ def update_group(group_id):
     if not name:
         return jsonify(error='Group name is required'), 400
 
-    execute_db(
+    execute_all_shards(
         "UPDATE CampusGroup SET Name = %s, Description = %s, IsRestricted = %s WHERE GroupID = %s",
         (name, description, is_restricted, group_id),
     )
@@ -290,13 +331,14 @@ def update_group(group_id):
 @jwt_required()
 def delete_group(group_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
         return jsonify(error='Only admin can delete group'), 403
 
-    execute_db("DELETE FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    execute_all_shards("DELETE FROM CampusGroup WHERE GroupID = %s", (group_id,))
     log_action('DELETE_GROUP', f"Deleted group {group_id}", user=get_current_username())
     return jsonify(message='Group deleted')
 
@@ -305,7 +347,8 @@ def delete_group(group_id):
 @jwt_required()
 def kick_member(group_id, member_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
@@ -313,7 +356,9 @@ def kick_member(group_id, member_id):
     if member_id == user_id:
         return jsonify(error='Cannot kick yourself'), 400
 
-    execute_db(
+    target_shard = get_shard_for_member(member_id)
+    execute_shard(
+        target_shard,
         "DELETE FROM GroupMembership WHERE GroupID = %s AND MemberID = %s",
         (group_id, member_id),
     )
@@ -325,20 +370,25 @@ def kick_member(group_id, member_id):
 @jwt_required()
 def make_admin(group_id, member_id):
     user_id = int(get_jwt_identity())
-    group = query_db("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,), one=True)
+    group_rows = query_all_shards("SELECT AdminID FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    group = group_rows[0] if group_rows else None
     if not group:
         return jsonify(error='Group not found'), 404
     if group['AdminID'] != user_id:
         return jsonify(error='Only admin can transfer admin role'), 403
 
     # Update the group admin
-    execute_db("UPDATE CampusGroup SET AdminID = %s WHERE GroupID = %s", (member_id, group_id))
+    execute_all_shards("UPDATE CampusGroup SET AdminID = %s WHERE GroupID = %s", (member_id, group_id))
     # Update roles
-    execute_db(
+    target_shard = get_shard_for_member(member_id)
+    execute_shard(
+        target_shard,
         "UPDATE GroupMembership SET Role = 'Admin' WHERE GroupID = %s AND MemberID = %s",
         (group_id, member_id),
     )
-    execute_db(
+    user_shard = get_shard_for_member(user_id)
+    execute_shard(
+        user_shard,
         "UPDATE GroupMembership SET Role = 'Member' WHERE GroupID = %s AND MemberID = %s",
         (group_id, user_id),
     )
@@ -350,7 +400,7 @@ def make_admin(group_id, member_id):
 @jwt_required()
 def get_group_posts(group_id):
     user_id = int(get_jwt_identity())
-    rows = query_db("""
+    rows = query_all_shards("""
         SELECT p.*, m.Username, m.Name, m.MemberType, m.AvatarColor,
                (SELECT COUNT(*) FROM PostLike WHERE PostID = p.PostID) AS likes,
                (SELECT COUNT(*) FROM Comment WHERE PostID = p.PostID) AS commentCount
@@ -360,7 +410,9 @@ def get_group_posts(group_id):
         ORDER BY p.CreatedAt DESC
     """, (group_id,))
 
-    liked_posts = {r['PostID'] for r in query_db(
+    user_shard = get_shard_for_member(user_id)
+    liked_posts = {r['PostID'] for r in query_shard(
+        user_shard,
         "SELECT PostID FROM PostLike WHERE MemberID = %s", (user_id,)
     )}
 

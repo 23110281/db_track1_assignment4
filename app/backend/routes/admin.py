@@ -2,7 +2,8 @@ from functools import wraps
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 import traceback
-from db import query_db, execute_db, get_db
+from db import get_db
+from shard_db import query_shard, query_all_shards, execute_shard, execute_all_shards, get_shard_for_member
 from audit import log_action, log_to_db, get_current_username
 
 admin_bp = Blueprint('admin', __name__)
@@ -13,7 +14,8 @@ def admin_required(fn):
     @jwt_required()
     def wrapper(*args, **kwargs):
         user_id = int(get_jwt_identity())
-        member = query_db("SELECT IsAdmin, Username FROM Member WHERE MemberID = %s", (user_id,), one=True)
+        user_shard = get_shard_for_member(user_id)
+        member = query_shard(user_shard, "SELECT IsAdmin, Username FROM Member WHERE MemberID = %s", (user_id,), one=True)
         if not member or not member['IsAdmin']:
             username = member['Username'] if member else f'uid:{user_id}'
             log_action('FORBIDDEN_ACCESS', f"Non-admin user '{username}' attempted {request.method} {request.path}", user=username)
@@ -33,14 +35,22 @@ def admin_required(fn):
 @admin_bp.route('/stats', methods=['GET'])
 @admin_required
 def get_stats():
-    members_count = query_db("SELECT COUNT(*) AS c FROM Member", one=True)['c']
-    posts_count = query_db("SELECT COUNT(*) AS c FROM Post", one=True)['c']
-    groups_count = query_db("SELECT COUNT(*) AS c FROM CampusGroup", one=True)['c']
-    polls_count = query_db("SELECT COUNT(*) AS c FROM Poll", one=True)['c']
-    comments_count = query_db("SELECT COUNT(*) AS c FROM Comment", one=True)['c']
-    jobs_count = query_db("SELECT COUNT(*) AS c FROM JobPost", one=True)['c']
+    members_count = sum(r['c'] for r in query_all_shards("SELECT COUNT(*) AS c FROM Member"))
+    posts_count = sum(r['c'] for r in query_all_shards("SELECT COUNT(*) AS c FROM Post"))
+    comments_count = sum(r['c'] for r in query_all_shards("SELECT COUNT(*) AS c FROM Comment"))
 
-    type_breakdown = query_db("SELECT MemberType, COUNT(*) AS c FROM Member GROUP BY MemberType")
+    # Replicated tables are counted from one canonical shard to avoid 3x overcount.
+    groups_row = query_shard(0, "SELECT COUNT(*) AS c FROM CampusGroup", one=True)
+    polls_row = query_shard(0, "SELECT COUNT(*) AS c FROM Poll", one=True)
+    jobs_row = query_shard(0, "SELECT COUNT(*) AS c FROM JobPost", one=True)
+    groups_count = groups_row['c'] if groups_row else 0
+    polls_count = polls_row['c'] if polls_row else 0
+    jobs_count = jobs_row['c'] if jobs_row else 0
+
+    type_breakdown_rows = query_all_shards("SELECT MemberType, COUNT(*) AS c FROM Member GROUP BY MemberType")
+    type_breakdown = {}
+    for row in type_breakdown_rows:
+        type_breakdown[row['MemberType']] = type_breakdown.get(row['MemberType'], 0) + row['c']
 
     return jsonify({
         'totalMembers': members_count,
@@ -49,14 +59,14 @@ def get_stats():
         'totalPolls': polls_count,
         'totalComments': comments_count,
         'totalJobs': jobs_count,
-        'memberTypeBreakdown': {r['MemberType']: r['c'] for r in type_breakdown},
+        'memberTypeBreakdown': type_breakdown,
     })
 
 
 @admin_bp.route('/members', methods=['GET'])
 @admin_required
 def get_members():
-    rows = query_db("""
+    rows = query_all_shards("""
         SELECT MemberID, Username, Name, Email, MemberType, ContactNumber, CreatedAt, AvatarColor, IsAdmin
         FROM Member ORDER BY MemberID
     """)
@@ -100,7 +110,8 @@ def update_member(member_id):
         return jsonify(error='No fields to update'), 400
 
     args.append(member_id)
-    execute_db(f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
+    member_shard = get_shard_for_member(member_id)
+    execute_shard(member_shard, f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
     log_action('ADMIN_UPDATE_MEMBER', f"Admin updated member {member_id}: {', '.join(updates)}", user=get_current_username())
     return jsonify(message='Member updated')
 
@@ -112,7 +123,8 @@ def delete_member(member_id):
     if member_id == user_id:
         return jsonify(error='Cannot delete yourself'), 400
 
-    execute_db("DELETE FROM Member WHERE MemberID = %s", (member_id,))
+    member_shard = get_shard_for_member(member_id)
+    execute_shard(member_shard, "DELETE FROM Member WHERE MemberID = %s", (member_id,))
     log_action('ADMIN_DELETE_MEMBER', f"Admin deleted member {member_id}", user=get_current_username())
     return jsonify(message='Member deleted')
 
@@ -120,7 +132,7 @@ def delete_member(member_id):
 @admin_bp.route('/groups', methods=['GET'])
 @admin_required
 def get_groups():
-    rows = query_db("""
+    rows = query_all_shards("""
         SELECT g.*,
                (SELECT COUNT(*) FROM GroupMembership WHERE GroupID = g.GroupID) AS memberCount,
                m.Name AS AdminName
@@ -128,8 +140,18 @@ def get_groups():
         LEFT JOIN Member m ON g.AdminID = m.MemberID
         ORDER BY g.GroupID
     """)
+    unique_groups = {}
+    for row in rows:
+        gid = row['GroupID']
+        if gid not in unique_groups:
+            unique_groups[gid] = dict(row)
+            unique_groups[gid]['memberCount'] = row.get('memberCount', 0)
+        else:
+            unique_groups[gid]['memberCount'] += row.get('memberCount', 0)
+            if not unique_groups[gid].get('AdminName') and row.get('AdminName'):
+                unique_groups[gid]['AdminName'] = row.get('AdminName')
     result = []
-    for r in rows:
+    for r in sorted(unique_groups.values(), key=lambda x: x['GroupID']):
         result.append({
             'GroupID': r['GroupID'],
             'Name': r['Name'],
@@ -144,7 +166,7 @@ def get_groups():
 @admin_bp.route('/groups/<int:group_id>', methods=['DELETE'])
 @admin_required
 def delete_group(group_id):
-    execute_db("DELETE FROM CampusGroup WHERE GroupID = %s", (group_id,))
+    execute_all_shards("DELETE FROM CampusGroup WHERE GroupID = %s", (group_id,))
     log_action('ADMIN_DELETE_GROUP', f"Admin deleted group {group_id}", user=get_current_username())
     return jsonify(message='Group deleted')
 

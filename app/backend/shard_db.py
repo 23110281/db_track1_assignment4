@@ -14,6 +14,15 @@ ALL_TABLES = {
     "Enrollment", "Course", "Organization", "Alumni", "Professor", "Student", "Member"
 }
 
+REPLICATED_ID_COLUMNS = {
+    "Course": "CourseID",
+    "CampusGroup": "GroupID",
+    "Enrollment": None,
+    "JobPost": "JobID",
+    "PollOption": "OptionID",
+    "Poll": "PollID",
+}
+
 def rewrite_sql_for_shard(sql: str, shard_id: int) -> str:
     """Dynamically rewrites SQL to use the appropriate prefix for simulated shard isolation."""
     for table in ALL_TABLES:
@@ -86,4 +95,64 @@ def execute_all_shards(sql: str, args=None):
             execute_shard(shard_id, sql, args)
         except Exception as e:
             print(f"[Execute Error - Shard {shard_id}]: {e}")
+
+
+def _parse_insert_table_and_columns(sql: str):
+    """Parse a simple INSERT statement and return (table_name, [columns])."""
+    match = re.search(
+        r'(?is)^\s*INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?\s*\(([^)]*)\)\s*VALUES\s*\(',
+        sql,
+    )
+    if not match:
+        return None, None
+    table = match.group(1)
+    columns = [c.strip().strip("`") for c in match.group(2).split(",") if c.strip()]
+    return table, columns
+
+
+def _inject_generated_id(sql: str, args: tuple, id_column: str, generated_id: int):
+    """Return SQL/args that include generated PK in INSERT column and values lists."""
+    # Insert ID column first in column list.
+    sql_with_col = re.sub(
+        r'(?is)^\s*(INSERT\s+INTO\s+`?[A-Za-z0-9_]+`?\s*\()',
+        r'\1`' + id_column + r'`, ',
+        sql,
+        count=1,
+    )
+    # Insert corresponding placeholder first in VALUES list.
+    sql_with_placeholder = re.sub(
+        r'(?is)(VALUES\s*\()',
+        r'\1%s, ',
+        sql_with_col,
+        count=1,
+    )
+    return sql_with_placeholder, (generated_id,) + tuple(args or ())
+
+
+def insert_replicated_row(sql: str, args=None, canonical_shard: int = 0):
+    """
+    Insert into a replicated table once, then replay on other shards with same primary key.
+    Returns the generated primary key (or 0 when table has no surrogate key).
+    """
+    table, columns = _parse_insert_table_and_columns(sql)
+    if not table or table not in REPLICATED_ID_COLUMNS:
+        raise ValueError("insert_replicated_row requires INSERT INTO a replicated table")
+
+    id_column = REPLICATED_ID_COLUMNS[table]
+    generated_id = execute_shard(canonical_shard, sql, args)
+
+    for shard_id in range(NUM_SHARDS):
+        if shard_id == canonical_shard:
+            continue
+        if id_column is None:
+            execute_shard(shard_id, sql, args)
+            continue
+
+        if id_column in columns:
+            execute_shard(shard_id, sql, args)
+        else:
+            replay_sql, replay_args = _inject_generated_id(sql, tuple(args or ()), id_column, generated_id)
+            execute_shard(shard_id, replay_sql, replay_args)
+
+    return generated_id if generated_id is not None else 0
 

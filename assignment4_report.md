@@ -2,7 +2,7 @@
 
 **Team**: Chernaugh
 
-**GitHub Repository**: [https://github.com/23110281/db_track1_assignment4/]{Link}  
+**GitHub Repository**: https://github.com/23110281/db_track1_assignment4/  
 **Video Demonstration**: [Insert Video Link Here]
 
 ---

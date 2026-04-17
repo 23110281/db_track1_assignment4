@@ -1,4 +1,4 @@
-# IITGN Connect — College Social Media Platform
+# IITGN Connect: College Social Media Platform
 
 **CS 432 Databases | Assignment 4 - Database Sharding**  
 **Indian Institute of Technology, Gandhinagar**

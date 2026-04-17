@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.security import check_password_hash, generate_password_hash
 from db import query_db, execute_db
+from shard_db import query_shard, execute_shard, get_shard_for_member
 from audit import log_action, get_current_username
 
 settings_bp = Blueprint('settings', __name__)
@@ -32,10 +33,11 @@ def update_profile():
         return jsonify(error='No fields to update'), 400
 
     args.append(user_id)
-    execute_db(f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
+    shard_id = get_shard_for_member(user_id)
+    execute_shard(shard_id, f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
 
     # Update subtype fields if provided
-    member = query_db("SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    member = query_shard(shard_id, "SELECT MemberType FROM Member WHERE MemberID = %s", (user_id,), one=True)
     if member:
         mt = member['MemberType']
         if mt == 'Student':
@@ -47,7 +49,7 @@ def update_profile():
                     sub_args.append(data[key])
             if sub_updates:
                 sub_args.append(user_id)
-                execute_db(f"UPDATE Student SET {', '.join(sub_updates)} WHERE MemberID = %s", tuple(sub_args))
+                execute_shard(shard_id, f"UPDATE Student SET {', '.join(sub_updates)} WHERE MemberID = %s", tuple(sub_args))
 
     log_action('UPDATE_PROFILE', f"Updated profile settings: {', '.join(u.split(' =')[0] for u in updates)}", user=get_current_username())
     return jsonify(message='Profile updated')
@@ -67,12 +69,13 @@ def change_password():
     if len(new_pw) < 6:
         return jsonify(error='Password must be at least 6 characters'), 400
 
-    member = query_db("SELECT Password FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    shard_id = get_shard_for_member(user_id)
+    member = query_shard(shard_id, "SELECT Password FROM Member WHERE MemberID = %s", (user_id,), one=True)
     if not member or not check_password_hash(member['Password'], current_pw):
         return jsonify(error='Current password is incorrect'), 401
 
     new_hash = generate_password_hash(new_pw)
-    execute_db("UPDATE Member SET Password = %s WHERE MemberID = %s", (new_hash, user_id))
+    execute_shard(shard_id, "UPDATE Member SET Password = %s WHERE MemberID = %s", (new_hash, user_id))
     log_action('CHANGE_PASSWORD', "Password changed", user=get_current_username())
     return jsonify(message='Password changed successfully')
 
@@ -98,12 +101,13 @@ def change_username():
     if not success:
         return jsonify(error=message), 400
 
-    # Check if username is taken
+    # Check if username is taken (cross-shard query necessary as username is not shard key)
     existing = query_db("SELECT MemberID FROM Member WHERE Username = %s AND MemberID != %s", (new_username, user_id), one=True)
     if existing:
         return jsonify(error='Username is already taken'), 409
 
-    execute_db("UPDATE Member SET Username = %s WHERE MemberID = %s", (new_username, user_id))
+    shard_id = get_shard_for_member(user_id)
+    execute_shard(shard_id, "UPDATE Member SET Username = %s WHERE MemberID = %s", (new_username, user_id))
     clear_otp(email)
     log_action('CHANGE_USERNAME', f"Username changed to '{new_username}'", user=new_username)
     return jsonify(message='Username changed successfully', username=new_username)
@@ -113,7 +117,8 @@ def change_username():
 @jwt_required()
 def get_privacy():
     user_id = int(get_jwt_identity())
-    member = query_db("SELECT ShowEmail, ShowContact, AllowQnA FROM Member WHERE MemberID = %s", (user_id,), one=True)
+    shard_id = get_shard_for_member(user_id)
+    member = query_shard(shard_id, "SELECT ShowEmail, ShowContact, AllowQnA FROM Member WHERE MemberID = %s", (user_id,), one=True)
     if not member:
         return jsonify(error='User not found'), 404
     return jsonify(
@@ -145,7 +150,8 @@ def update_privacy():
         return jsonify(error='No fields to update'), 400
 
     args.append(user_id)
-    execute_db(f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
+    shard_id = get_shard_for_member(user_id)
+    execute_shard(shard_id, f"UPDATE Member SET {', '.join(updates)} WHERE MemberID = %s", tuple(args))
     log_action('UPDATE_PRIVACY', f"Updated privacy settings: {', '.join(u.split(' =')[0] for u in updates)}", user=get_current_username())
     return jsonify(message='Privacy settings updated')
 
@@ -154,6 +160,7 @@ def update_privacy():
 @jwt_required()
 def delete_account():
     user_id = int(get_jwt_identity())
+    shard_id = get_shard_for_member(user_id)
     log_action('DELETE_ACCOUNT', f"User deleted their own account (MemberID: {user_id})", user=get_current_username())
-    execute_db("DELETE FROM Member WHERE MemberID = %s", (user_id,))
+    execute_shard(shard_id, "DELETE FROM Member WHERE MemberID = %s", (user_id,))
     return jsonify(message='Account deleted')

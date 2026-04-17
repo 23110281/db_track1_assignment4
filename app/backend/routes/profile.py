@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from db import query_db, execute_db
+from shard_db import query_shard, execute_shard, get_shard_for_member
 from audit import log_action, get_current_username
 
 profile_bp = Blueprint('profile', __name__)
@@ -10,7 +11,8 @@ profile_bp = Blueprint('profile', __name__)
 @jwt_required()
 def get_profile(member_id):
     viewer_id = int(get_jwt_identity())
-    member = query_db("SELECT * FROM Member WHERE MemberID = %s", (member_id,), one=True)
+    shard_id = get_shard_for_member(member_id)
+    member = query_shard(shard_id, "SELECT * FROM Member WHERE MemberID = %s", (member_id,), one=True)
     if not member:
         return jsonify(error='Member not found'), 404
 
@@ -35,7 +37,7 @@ def get_profile(member_id):
 
     # Subtype details
     if member['MemberType'] == 'Student':
-        sub = query_db("SELECT * FROM Student WHERE MemberID = %s", (member_id,), one=True)
+        sub = query_shard(shard_id, "SELECT * FROM Student WHERE MemberID = %s", (member_id,), one=True)
         if sub:
             user.update({
                 'Programme': sub['Programme'],
@@ -44,7 +46,7 @@ def get_profile(member_id):
                 'MessAssignment': sub['MessAssignment'],
             })
     elif member['MemberType'] == 'Professor':
-        sub = query_db("SELECT * FROM Professor WHERE MemberID = %s", (member_id,), one=True)
+        sub = query_shard(shard_id, "SELECT * FROM Professor WHERE MemberID = %s", (member_id,), one=True)
         if sub:
             user.update({
                 'Designation': sub['Designation'],
@@ -52,7 +54,7 @@ def get_profile(member_id):
                 'JoiningDate': str(sub['JoiningDate']),
             })
     elif member['MemberType'] == 'Alumni':
-        sub = query_db("SELECT * FROM Alumni WHERE MemberID = %s", (member_id,), one=True)
+        sub = query_shard(shard_id, "SELECT * FROM Alumni WHERE MemberID = %s", (member_id,), one=True)
         if sub:
             user.update({
                 'CurrentOrganization': sub['CurrentOrganization'],
@@ -60,7 +62,7 @@ def get_profile(member_id):
                 'Verified': bool(sub['Verified']),
             })
     elif member['MemberType'] == 'Organization':
-        sub = query_db("SELECT * FROM Organization WHERE MemberID = %s", (member_id,), one=True)
+        sub = query_shard(shard_id, "SELECT * FROM Organization WHERE MemberID = %s", (member_id,), one=True)
         if sub:
             user.update({
                 'OrgType': sub['OrgType'],
@@ -69,7 +71,7 @@ def get_profile(member_id):
             })
 
     # Posts by this member
-    posts = query_db("""
+    posts = query_shard(shard_id, """
         SELECT p.*,
                (SELECT COUNT(*) FROM PostLike WHERE PostID = p.PostID) AS likes,
                (SELECT COUNT(*) FROM Comment WHERE PostID = p.PostID) AS commentCount,
@@ -92,7 +94,7 @@ def get_profile(member_id):
     } for p in posts]
 
     # Groups
-    groups = query_db("""
+    groups = query_shard(shard_id, """
         SELECT g.GroupID, g.Name, gm.Role
         FROM GroupMembership gm
         JOIN CampusGroup g ON gm.GroupID = g.GroupID
@@ -107,7 +109,8 @@ def get_profile(member_id):
 @jwt_required()
 def get_claims(member_id):
     user_id = int(get_jwt_identity())
-    claims = query_db("""
+    shard_id = get_shard_for_member(member_id)
+    claims = query_shard(shard_id, """
         SELECT pcq.*,
                (SELECT COUNT(*) FROM ProfileClaimVote WHERE ClaimID = pcq.ClaimID AND IsAgree = TRUE) AS agreeCount,
                (SELECT COUNT(*) FROM ProfileClaimVote WHERE ClaimID = pcq.ClaimID AND IsAgree = FALSE) AS disagreeCount
@@ -148,7 +151,8 @@ def create_claim(member_id):
     if not question or not response:
         return jsonify(error='Question and response required'), 400
 
-    claim_id = execute_db(
+    shard_id = get_shard_for_member(member_id)
+    claim_id = execute_shard(shard_id,
         "INSERT INTO ProfileClaimQuestion (MemberID, QuestionText, UserResponse) VALUES (%s,%s,%s)",
         (member_id, question, response),
     )
@@ -167,7 +171,8 @@ def update_claim(claim_id):
         return jsonify(error='Unauthorized'), 403
 
     data = request.get_json()
-    execute_db(
+    shard_id = get_shard_for_member(claim['MemberID'])
+    execute_shard(shard_id,
         "UPDATE ProfileClaimQuestion SET QuestionText = %s, UserResponse = %s WHERE ClaimID = %s",
         (data.get('questionText', claim['QuestionText']), data.get('userResponse', claim['UserResponse']), claim_id),
     )
@@ -185,7 +190,8 @@ def delete_claim(claim_id):
     if claim['MemberID'] != user_id:
         return jsonify(error='Unauthorized'), 403
 
-    execute_db("DELETE FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,))
+    shard_id = get_shard_for_member(claim['MemberID'])
+    execute_shard(shard_id, "DELETE FROM ProfileClaimQuestion WHERE ClaimID = %s", (claim_id,))
     log_action('DELETE_CLAIM', f"Deleted profile claim {claim_id}", user=get_current_username())
     return jsonify(message='Claim deleted')
 
@@ -200,26 +206,27 @@ def vote_claim(claim_id):
     if is_agree is None:
         return jsonify(error='isAgree required'), 400
 
+    shard_id = get_shard_for_member(user_id)
     # Upsert vote
-    existing = query_db(
+    existing = query_shard(shard_id,
         "SELECT * FROM ProfileClaimVote WHERE ClaimID = %s AND VoterID = %s",
         (claim_id, user_id), one=True,
     )
     if existing:
         if existing['IsAgree'] == is_agree:
             # Toggle off
-            execute_db("DELETE FROM ProfileClaimVote WHERE ClaimID = %s AND VoterID = %s", (claim_id, user_id))
+            execute_shard(shard_id, "DELETE FROM ProfileClaimVote WHERE ClaimID = %s AND VoterID = %s", (claim_id, user_id))
             log_action('REMOVE_CLAIM_VOTE', f"Removed vote on claim {claim_id}", user=get_current_username())
             return jsonify(message='Vote removed')
         else:
-            execute_db(
+            execute_shard(shard_id,
                 "UPDATE ProfileClaimVote SET IsAgree = %s WHERE ClaimID = %s AND VoterID = %s",
                 (is_agree, claim_id, user_id),
             )
             log_action('UPDATE_CLAIM_VOTE', f"Updated vote on claim {claim_id} to {'agree' if is_agree else 'disagree'}", user=get_current_username())
             return jsonify(message='Vote updated')
     else:
-        execute_db(
+        execute_shard(shard_id,
             "INSERT INTO ProfileClaimVote (ClaimID, VoterID, IsAgree) VALUES (%s,%s,%s)",
             (claim_id, user_id, is_agree),
         )

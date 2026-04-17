@@ -127,7 +127,8 @@ def delete_post(post_id):
     if post['AuthorID'] != user_id and not member.get('IsAdmin'):
         return jsonify(error='Unauthorized'), 403
 
-    execute_all_shards("DELETE FROM Post WHERE PostID = %s", (post_id,))
+    shard_id = get_shard_for_member(post['AuthorID'])
+    execute_shard(shard_id, "DELETE FROM Post WHERE PostID = %s", (post_id,))
     log_action('DELETE_POST', f"Deleted post {post_id}", user=get_current_username())
     return jsonify(message='Post deleted')
 
@@ -197,7 +198,8 @@ def update_comment(comment_id):
     if comment['AuthorID'] != user_id:
         return jsonify(error='Unauthorized'), 403
 
-    execute_all_shards("UPDATE Comment SET Content = %s WHERE CommentID = %s", (content, comment_id))
+    shard_id = get_shard_for_member(comment['AuthorID'])
+    execute_shard(shard_id, "UPDATE Comment SET Content = %s WHERE CommentID = %s", (content, comment_id))
     log_action('UPDATE_COMMENT', f"Updated comment {comment_id}", user=get_current_username())
     return jsonify(message='Comment updated')
 
@@ -217,7 +219,8 @@ def delete_comment(comment_id):
     if comment['AuthorID'] != user_id and not member.get('IsAdmin'):
         return jsonify(error='Unauthorized'), 403
 
-    execute_all_shards("DELETE FROM Comment WHERE CommentID = %s", (comment_id,))
+    shard_id = get_shard_for_member(comment['AuthorID'])
+    execute_shard(shard_id, "DELETE FROM Comment WHERE CommentID = %s", (comment_id,))
     log_action('DELETE_COMMENT', f"Deleted comment {comment_id}", user=get_current_username())
     return jsonify(message='Comment deleted')
 
@@ -226,11 +229,12 @@ def delete_comment(comment_id):
 @jwt_required()
 def toggle_like(post_id):
     user_id = int(get_jwt_identity())
-    existing = query_all_shards(
+    shard_id = get_shard_for_member(user_id)
+    existing = query_shard(shard_id,
         "SELECT * FROM PostLike WHERE PostID = %s AND MemberID = %s", (post_id, user_id)
     )
     if existing:
-        execute_all_shards("DELETE FROM PostLike WHERE PostID = %s AND MemberID = %s", (post_id, user_id))
+        execute_shard(shard_id, "DELETE FROM PostLike WHERE PostID = %s AND MemberID = %s", (post_id, user_id))
         log_action('UNLIKE_POST', f"Unliked post {post_id}", user=get_current_username())
         return jsonify(liked=False)
     else:

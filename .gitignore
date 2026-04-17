@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+app/backend/__pycache__/shard_db.cpython-314.pyc
+venv/
+.env

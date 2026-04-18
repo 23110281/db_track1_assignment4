@@ -7,13 +7,27 @@
 
 ## Table of Contents
 
+- [Team & Project Links](#team--project-links)
 - [Project Overview](#project-overview)
 - [Setup & Replicability](#setup--replicability)
 - [1. Assignment 4: Database Sharding Architecture](#1-assignment-4-database-sharding-architecture)
 - [2. Database Schema, API & Session Management](#2-database-schema-api--session-management)
 - [3. Security, Access Control & Audit Logging](#3-security-access-control--audit-logging)
 - [4. Indexing & Query Optimization](#4-indexing--query-optimization)
-- [Team](#team)
+
+---
+
+## Team & Project Links
+
+| Name                      | Student ID |
+| ------------------------- | ---------- |
+| Patel Ridham Vijaykumar   | 23110238   |
+| Patel Parthiv Rajeshkumar | 23110237   |
+| Laksh Jain                | 23110185   |
+| Shriniket Behera          | 23110306   |
+| Rudra Pratap Singh        | 23110281   |
+
+- **Video Demonstration:** [https://youtu.be/Xx92OgD0WwA](https://youtu.be/Xx92OgD0WwA)
 
 ---
 
